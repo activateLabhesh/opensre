@@ -389,7 +389,10 @@ def test_collect_runs_keeps_the_timestamp_cutoff_and_proves_earlier_failures() -
     collected = collect_runs(client, owner="o", repo="r", window_days=30, now=now)
 
     assert client.run_queries
-    assert all(">=2026-08-08T18:00:00Z" in str(call) for call in client.run_queries)
+    assert all(
+        str(call.get("created", "")).startswith("2026-08-08T18:00:00Z..")
+        for call in client.run_queries
+    )
     assert [run.run_id for run in collected.pr_runs] == [11]
     assert collected.pr_runs[0].retried_to_green is True
     assert collected.pr_runs[0].earlier_failure_started_at is not None
@@ -409,6 +412,91 @@ def test_collect_runs_does_not_treat_a_cancelled_rerun_as_a_flake() -> None:
     collected = collect_runs(client, owner="o", repo="r", window_days=30, now=now)
 
     assert collected.pr_runs[0].retried_to_green is False
+
+
+def test_collect_runs_splits_the_window_past_the_listing_ceiling() -> None:
+    # Arrange: 1,500 PR runs spread over 30 days; one query can only return 1,000.
+    now = datetime(2026, 9, 7, 18, 0, tzinfo=UTC)
+    rows = [
+        _payload(index, created_at=_iso(now - timedelta(minutes=28 * index)))
+        for index in range(1, 1501)
+    ]
+    client = _FakeGitHub(repository={"default_branch": "main"}, runs=rows)
+
+    # Act
+    collected = collect_runs(client, owner="o", repo="r", window_days=30, now=now)
+
+    # Assert: every run is collected exactly once, and no slice needed a gap notice.
+    assert len(collected.pr_runs) == 1500
+    assert len({run.run_id for run in collected.pr_runs}) == 1500
+    assert not any("listing ceiling" in n for n in collected.coverage_notices)
+    assert all(".." in q.get("created", "") for q in client.run_queries)
+
+
+def test_collect_runs_treats_exactly_the_ceiling_as_complete() -> None:
+    now = datetime(2026, 9, 7, 18, 0, tzinfo=UTC)
+    rows = [
+        _payload(index, created_at=_iso(now - timedelta(minutes=40 * index)))
+        for index in range(1, 1001)
+    ]
+    client = _FakeGitHub(repository={"default_branch": "main"}, runs=rows)
+
+    collected = collect_runs(client, owner="o", repo="r", window_days=30, now=now)
+
+    assert len(collected.pr_runs) == 1000
+    assert collected.coverage_notices == []
+    # One listing sufficed: the whole-window query was not split.
+    assert sum(1 for q in client.run_queries if q.get("event") == "pull_request") <= 2
+
+
+def test_rerun_budget_is_spent_on_merged_prs_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    from integrations.github.tools.ci_analytics import collector
+
+    monkeypatch.setattr(collector, "_MAX_ATTEMPT_LOOKUPS", 1)
+    now = datetime(2026, 9, 7, 18, 0, tzinfo=UTC)
+    # The unmerged re-run is older, so plain ordering would check it first.
+    unmerged = _payload(5, created_at="2026-09-01T09:00:00Z", attempt=2, branch="feat/other")
+    merged = _payload(6, created_at="2026-09-02T09:00:00Z", attempt=2, branch="feat/x")
+    attempts = {
+        (5, 1): _payload(5, created_at=unmerged["created_at"], conclusion="failure", attempt=1),
+        (6, 1): _payload(6, created_at=merged["created_at"], conclusion="failure", attempt=1),
+    }
+    pulls = [
+        {
+            "number": 42,
+            "merged_at": "2026-09-03T09:00:00Z",
+            "updated_at": "2026-09-03T09:00:00Z",
+            "head": {"ref": "feat/x", "repo": {"full_name": "o/r"}},
+        }
+    ]
+    client = _FakeGitHub(
+        repository={"default_branch": "main"},
+        runs=[unmerged, merged],
+        attempts=attempts,
+        pulls=pulls,
+    )
+
+    collected = collect_runs(client, owner="o", repo="r", window_days=30, now=now)
+
+    by_id = {run.run_id: run for run in collected.pr_runs}
+    assert by_id[6].retried_to_green is True
+    assert by_id[5].retried_to_green is False
+
+
+def test_collect_runs_reports_an_hour_that_still_exceeds_the_ceiling() -> None:
+    now = datetime(2026, 9, 7, 18, 0, tzinfo=UTC)
+    burst = now - timedelta(days=3)
+    rows = [
+        _payload(index, created_at=_iso(burst + timedelta(seconds=index)))
+        for index in range(1, 1201)
+    ]
+    client = _FakeGitHub(repository={"default_branch": "main"}, runs=rows)
+
+    collected = collect_runs(client, owner="o", repo="r", window_days=30, now=now)
+
+    assert any("listing ceiling" in n for n in collected.coverage_notices)
+    # The capped hour keeps its 1,000 rows; a neighbouring slice may add the rest.
+    assert 1000 <= len(collected.pr_runs) < 1200
 
 
 def test_collect_runs_reports_unavailable_attempt_history_instead_of_hiding_it() -> None:
@@ -456,12 +544,13 @@ def _payload(
     conclusion: str = "success",
     attempt: int = 1,
     event: str = "pull_request",
+    branch: str = "feat/x",
 ) -> dict[str, Any]:
     return {
         "id": run_id,
         "name": "CI",
         "workflow_id": 1,
-        "head_branch": "feat/x",
+        "head_branch": branch,
         "head_sha": "abc",
         "event": event,
         "conclusion": conclusion,
@@ -489,9 +578,17 @@ class _FakeGitHub:
         self._pulls = pulls or []
         self.run_queries: list[dict[str, Any]] = []
 
-    def request(self, method: str, path: str, **_kwargs: Any) -> dict[str, Any]:
+    def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         if path == "/repos/o/r":
             return self._repository
+        if path == "/repos/o/r/actions/runs":
+            params = kwargs.get("params") or {}
+            self.run_queries.append(params)
+            inside = self._runs_in(params)
+            return {"total_count": len(inside), "workflow_runs": inside[:100]}
+        if path == "/repos/o/r/pulls":
+            page = int((kwargs.get("params") or {}).get("page", 1))
+            return self._pulls[(page - 1) * 100 : page * 100]
         marker = "/actions/runs/"
         if marker in path and "/attempts/" in path:
             rest = path.split(marker, 1)[1]
@@ -502,12 +599,23 @@ class _FakeGitHub:
                 raise GitHubApiError("attempt not found", status_code=404) from exc
         raise AssertionError(f"unexpected {method} {path}")
 
+    def _runs_in(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Rows for one listing query: PR event only, inside the created range, newest first."""
+        if params.get("event") != "pull_request":
+            return []
+        start, _, end = str(params.get("created", "")).partition("..")
+        inside = [
+            row
+            for row in self._runs
+            if (not start or row["created_at"] >= start) and (not end or row["created_at"] <= end)
+        ]
+        return sorted(inside, key=lambda row: row["created_at"], reverse=True)
+
     def paginate(self, path: str, *, params: dict[str, Any] | None = None, **_kwargs: Any) -> list:
         if path == "/repos/o/r/actions/runs":
             self.run_queries.append(params or {})
-            if (params or {}).get("event") == "pull_request":
-                return self._runs
-            return []
+            # GitHub returns at most 1,000 rows for one listing.
+            return self._runs_in(params or {})[:1000]
         if path == "/repos/o/r/pulls":
             return self._pulls
         return []
