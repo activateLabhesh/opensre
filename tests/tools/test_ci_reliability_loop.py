@@ -106,3 +106,99 @@ def _scheduled_stub(owner: str, repo: str) -> ci_loop.ScheduledLoop:
     )
     loop = ManualLoop(task=task, channels=(Provider.INTERACTIVE_SHELL,), next_run="soon")
     return ci_loop.ScheduledLoop(loop=loop, reused=False)
+
+
+def test_loop_names_the_deterministic_builder_with_its_arguments(store_path: Path) -> None:
+    import json
+
+    from infrastructure.scheduling.scheduler.loop_constants import (
+        LOOP_REPORT_ARGS_PARAM,
+        LOOP_REPORT_PARAM,
+    )
+
+    scheduled = ci_loop.schedule_ci_reliability_loop(
+        "acme", "app", timezone="UTC", store_path=store_path
+    )
+
+    params = scheduled.loop.task.params
+    assert params[LOOP_REPORT_PARAM] == ci_loop.REPORT_NAME
+    assert json.loads(params[LOOP_REPORT_ARGS_PARAM]) == {
+        "owner": "acme",
+        "repo": "app",
+        "days": "7",
+    }
+
+
+def test_a_loop_saved_before_the_builder_existed_is_upgraded_in_place(store_path: Path) -> None:
+    # Arrange: a legacy loop with the same prompt but no builder configured.
+    import json
+
+    from infrastructure.scheduling.scheduler.loop_constants import (
+        LOOP_REPORT_ARGS_PARAM,
+        LOOP_REPORT_PARAM,
+    )
+    from infrastructure.scheduling.scheduler.loops import create_manual_loop
+
+    legacy = create_manual_loop(
+        name=ci_loop.loop_name("acme", "app"),
+        prompt=ci_loop.loop_prompt("acme", "app"),
+        cron="0 8 * * 1-5",
+        channels=["interactive_shell"],
+        store_path=store_path,
+    )
+    assert LOOP_REPORT_PARAM not in legacy.task.params
+
+    # Act
+    scheduled = ci_loop.schedule_ci_reliability_loop(
+        "acme", "app", timezone="UTC", store_path=store_path
+    )
+
+    # Assert: same loop, now carrying the builder, persisted in the store.
+    assert scheduled.reused is True
+    assert scheduled.task_id == legacy.task.id
+    stored = next(t for t in list_tasks(store_path) if t.id == legacy.task.id)
+    assert stored.params[LOOP_REPORT_PARAM] == ci_loop.REPORT_NAME
+    assert json.loads(stored.params[LOOP_REPORT_ARGS_PARAM])["repo"] == "app"
+
+
+def test_build_report_renders_the_analytics_and_keeps_a_json_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange: GitHub answers with no runs; the token is present.
+    import json
+
+    from integrations.github import client as github_client
+    from integrations.github.tools.ci_analytics import collector
+    from integrations.github.tools.ci_analytics.collector import CollectedRuns
+
+    monkeypatch.setattr(github_client, "resolve_github_token", lambda _t: "tok")
+    monkeypatch.setattr(
+        collector,
+        "collect_runs",
+        lambda *_a, **_k: CollectedRuns(
+            default_branch="main", branch_runs=[], pr_runs=[], merged_prs=(), coverage_notices=()
+        ),
+    )
+
+    # Act
+    report = ci_loop.build_report(
+        {"owner": "acme", "repo": "app", "days": "7"}, snapshot_dir=tmp_path
+    )
+
+    # Assert: header, headline, and a traceable snapshot on disk.
+    assert "CI/CD reliability for acme/app, last 7 days" in report
+    assert "Raw data: " in report
+    snapshot = Path(report.rsplit("Raw data: ", 1)[1].strip())
+    assert snapshot.parent == tmp_path / "acme-app"
+    assert json.loads(snapshot.read_text())["executions"] == 0
+
+
+def test_build_report_without_a_token_raises_a_generic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from integrations.github import client as github_client
+
+    monkeypatch.setattr(github_client, "resolve_github_token", lambda _t: "")
+
+    with pytest.raises(RuntimeError, match="No GitHub token"):
+        ci_loop.build_report({"owner": "acme", "repo": "app"})
