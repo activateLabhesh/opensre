@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -14,10 +15,10 @@ from gateway.transports.telegram.poller.poller import (
 
 def test_decode_telegram_response_parses_non_200_json() -> None:
     response = httpx.Response(
-        409,
+        HTTPStatus.CONFLICT,
         json={
             "ok": False,
-            "error_code": 409,
+            "error_code": HTTPStatus.CONFLICT,
             "description": "Conflict: terminated by other getUpdates request",
         },
     )
