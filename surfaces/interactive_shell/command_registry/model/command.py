@@ -129,10 +129,21 @@ def _interactive_set_provider(console: Console) -> bool | None:
 
         crumb_model = f"{crumb_set}{CRUMB_SEP}{provider_value}"
         while True:
+            from surfaces.interactive_shell.command_registry.model.provider_models import (
+                model_menu_choices,
+            )
+
+            reasoning_choices = model_menu_choices(
+                provider,
+                console,
+                fallback=_reasoning_model_menu_choices(provider),
+            )
+            if reasoning_choices is None:
+                break
             reasoning_choice = repl_choose_one(
                 title="reasoning model",
                 breadcrumb=crumb_model,
-                choices=_reasoning_model_menu_choices(provider),
+                choices=reasoning_choices,
             )
             if reasoning_choice is None:
                 break
