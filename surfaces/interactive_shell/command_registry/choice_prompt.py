@@ -19,6 +19,9 @@ from infrastructure.terminal import theme as ui_theme
 from infrastructure.terminal.notify import NotifyEvent, play_notification
 from surfaces.interactive_shell.command_registry.types import SlashCommand
 from surfaces.interactive_shell.runtime import Session
+from surfaces.interactive_shell.runtime.startup.onboarding_telemetry import (
+    capture_onboarding_choice,
+)
 from surfaces.interactive_shell.ui.ask_user import CUSTOM_OPTION, repl_ask_user
 from surfaces.interactive_shell.ui.handoff_questions import render_choice_selection
 from surfaces.interactive_shell.ui.prompt_visibility import clear_live_prompt_paint
@@ -55,6 +58,8 @@ def _cmd_choose(session: Session, console: Console, args: list[str]) -> bool:
         if picked is None:
             console.print(f"[{ui_theme.DIM}]Selection cancelled — type a reply instead.[/]")
             session.terminal.awaiting_handoff_answer = False
+            session.active_skill = None
+            session.active_skill_tools = ()
             return True
         session.terminal.set_auto_command(format_ask_user_answers(items, picked))
         session.terminal.awaiting_handoff_answer = True
@@ -62,6 +67,12 @@ def _cmd_choose(session: Session, console: Console, args: list[str]) -> bool:
 
     option_choices = [(option, option) for option in items[0].options]
     option_choices.append((CUSTOM_OPTION, CUSTOM_OPTION))
+    custom_answer = False
+
+    def mark_custom_answer() -> None:
+        nonlocal custom_answer
+        custom_answer = True
+
     # Custom row: type in place on the OpenSRE option array (Droid-style).
     picked_one = repl_choose_one(
         title=items[0].title,
@@ -70,10 +81,15 @@ def _cmd_choose(session: Session, console: Console, args: list[str]) -> bool:
         multi_select=items[0].multi_select,
         header="Ask User",
         letter_keys=True,
+        note=pending.note,
+        on_custom_answer=mark_custom_answer,
     )
+    capture_onboarding_choice(session.active_skill, picked_one, custom=custom_answer)
     if picked_one is None:
         console.print(f"[{ui_theme.DIM}]Selection cancelled — type a reply instead.[/]")
         session.terminal.awaiting_handoff_answer = False
+        session.active_skill = None
+        session.active_skill_tools = ()
         return True
 
     command = pending.commands.get(picked_one) or (picked_one if picked_one.startswith("/") else "")
