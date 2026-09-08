@@ -85,6 +85,9 @@ def turn_has_session_goal_evidence(result: Any, *, bookkeeping_calls: int = 0) -
     the evidence for itself.
     """
     action = getattr(result, "action_result", None)
+    qualified = getattr(action, "evidence_success_count", None)
+    if qualified is not None:
+        return bool(qualified > 0)
     action_succeeded = 0
     if action is not None:
         try:
@@ -96,7 +99,7 @@ def turn_has_session_goal_evidence(result: Any, *, bookkeeping_calls: int = 0) -
 
 def goal_has_session_goal_evidence(goal: SessionGoal, result: Any) -> bool:
     """True when this turn succeeded at a tool, or an earlier turn stored findings."""
-    return turn_has_session_goal_evidence(result) or bool(goal.findings)
+    return turn_has_session_goal_evidence(result) or goal.tool_success_seen or bool(goal.findings)
 
 
 def _need_tool_evidence_reason(judge_reason: str) -> str:
@@ -120,6 +123,7 @@ def _review_ticks(
     newly: frozenset[int],
     text: str,
     evidence: bool,
+    tool_evidence: str,
     validate: ValidateFn | None,
     validate_llm: AgentLLMClient | None,
 ) -> _TickReview:
@@ -145,6 +149,9 @@ def _review_ticks(
             reply=text,
             evidence=evidence,
             ticked=ticked,
+            tool_evidence=tool_evidence,
+            findings=current.findings,
+            prior_tool_evidence=current.tool_evidence,
         )
     except Exception:
         log.debug("session-goal tick validator unavailable", exc_info=True)
@@ -162,6 +169,7 @@ def _run_judge(
     *,
     text: str,
     evidence: bool,
+    tool_evidence: str,
     judge: JudgeFn | None,
     judge_llm: AgentLLMClient | None,
 ) -> SessionGoalJudgeVerdict | None:
@@ -183,6 +191,9 @@ def _run_judge(
             reply=text,
             evidence=evidence,
             unfinished=unfinished,
+            tool_evidence=tool_evidence,
+            findings=current.findings,
+            prior_tool_evidence=current.tool_evidence,
             previous_reason=current.last_verdict,
         )
     except Exception:
@@ -272,7 +283,8 @@ def evaluate_session_goal(
                 current = current.with_completed(current.completed | stored.completed)
     current = credit_completed_plan_steps(current, session)
     turn_evidence = turn_has_session_goal_evidence(result, bookkeeping_calls=bookkeeping)
-    evidence = turn_evidence or bool(current.findings)
+    evidence = turn_evidence or current.tool_success_seen or bool(current.findings)
+    tool_evidence = getattr(getattr(result, "action_result", None), "tool_evidence", "")
     if turn_evidence:
         current = current.with_tool_progress()
 
@@ -282,16 +294,17 @@ def evaluate_session_goal(
         newly=newly,
         text=text,
         evidence=evidence,
+        tool_evidence=tool_evidence,
         validate=validate,
         validate_llm=validate_llm,
     )
-    ticks_unvalidated = review.kept is None and bool(newly)
-    if review.kept is not None and review.kept != newly:
-        current = current.with_completed((current.completed - newly) | review.kept)
+    kept = review.kept or frozenset()
+    if kept != newly:
+        current = current.with_completed((current.completed - newly) | kept)
     if current.new_ticks or current.bookkeeping_calls:
         current = replace(current, new_ticks=frozenset(), bookkeeping_calls=0)
 
-    if current.checklist_complete and evidence and not ticks_unvalidated:
+    if current.checklist_complete and evidence and judge is None and judge_llm is None:
         verdict = SessionGoalVerdict(
             status=SessionGoalStatus.ACHIEVED,
             reason=SessionGoalReason.CHECKLIST_COMPLETE,
@@ -306,6 +319,7 @@ def evaluate_session_goal(
             current,
             text=text,
             evidence=evidence,
+            tool_evidence=tool_evidence,
             judge=judge,
             judge_llm=judge_llm,
         )
@@ -370,6 +384,10 @@ def build_session_goal_evaluator(llm_factory: JudgeLlmFactory) -> Callable[..., 
 
     def _evaluate(goal: SessionGoal, result: Any, *, session: Any | None = None) -> str:
         llm = _client()
+        if llm is None:
+            return default_evaluate_session_goal(
+                goal, result, session=session, judge=lambda **_kw: None, validate=lambda **_kw: None
+            )
         return default_evaluate_session_goal(
             goal, result, session=session, judge_llm=llm, validate_llm=llm
         )
