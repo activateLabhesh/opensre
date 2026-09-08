@@ -29,6 +29,7 @@ def session_goal_to_payload(goal: SessionGoal) -> dict[str, Any]:
         "token_baseline_input": int(goal.token_baseline_input),
         "token_baseline_output": int(goal.token_baseline_output),
         "host_owned": bool(goal.host_owned),
+        "last_progress_turns_used": int(goal.last_progress_turns_used),
     }
     if goal.started_at is not None:
         payload["started_at"] = float(goal.started_at)
@@ -86,6 +87,7 @@ def session_goal_from_payload(payload: Any) -> SessionGoal | None:
     except (TypeError, ValueError):
         token_in, token_out = 0, 0
     host_owned = bool(payload.get("host_owned", False))
+    last_progress_turns_used = _restore_last_progress_turns_used(payload, turns_used)
     return SessionGoal(
         condition=condition.strip(),
         max_outer_turns=max_outer,
@@ -99,7 +101,21 @@ def session_goal_from_payload(payload: Any) -> SessionGoal | None:
         token_baseline_input=token_in,
         token_baseline_output=token_out,
         host_owned=host_owned,
+        last_progress_turns_used=last_progress_turns_used,
     )
+
+
+def _restore_last_progress_turns_used(payload: dict[str, Any], turns_used: int) -> int:
+    """Stall watermark, or ``turns_used`` when the key is missing or unreadable."""
+    if "last_progress_turns_used" not in payload:
+        return turns_used
+    raw = payload.get("last_progress_turns_used")
+    if raw is None:
+        return turns_used
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return turns_used
 
 
 def session_goal_state_snapshot(session: Any) -> dict[str, Any]:

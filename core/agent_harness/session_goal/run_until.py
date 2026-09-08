@@ -11,7 +11,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
-from core.agent_harness.session.terminal_access import clear_pending_autosubmit
+from core.agent_harness.session.pending_choice import PendingUserChoice
+from core.agent_harness.session.terminal_access import (
+    clear_pending_autosubmit,
+    session_terminal,
+    set_auto_command,
+)
 from core.agent_harness.session_goal.continuation import continuation_prompt
 from core.agent_harness.session_goal.evaluate import (
     default_evaluate_session_goal,
@@ -118,6 +123,46 @@ def _announce_working(
     return working
 
 
+_NO_PROGRESS_TURNS = 2
+STALL_MENU_TITLE = "The goal made no checklist progress in 2 turns. How should I continue?"
+STALL_OPTION_MORE = "Keep going for one more turn"
+STALL_OPTION_STOP = "Stop here; the work above is enough"
+STALL_COMMANDS = {STALL_OPTION_MORE: "/goal resume", STALL_OPTION_STOP: "/goal clear"}
+
+
+def goal_has_stalled(goal: SessionGoal) -> bool:
+    """True when a checklist goal has gone two turns without a new tick."""
+    if not goal.checklist or goal.checklist_complete:
+        return False
+    return goal.turns_used - goal.last_progress_turns_used >= _NO_PROGRESS_TURNS
+
+
+def pause_for_no_progress(
+    session: Any, active: SessionGoal, on_progress: ProgressFn | None
+) -> SessionGoal:
+    """Pause a stalled goal; the shell also opens a menu with the ways forward.
+
+    Two full turns without a new tick means repeating the same steps to the
+    budget. The interactive shell asks: one more turn, stop, or typed guidance
+    (the custom row). Headless hosts have no ``/choose`` handler, so they only
+    pause and return.
+    """
+    paused = active.with_status(SessionGoalStatus.PAUSED).with_reason(
+        SessionGoalReason.PAUSED_NO_PROGRESS
+    )
+    paused = _paint(session, paused, on_progress, rederive=False)
+    _clear_host_autosubmit(session)
+    if session_terminal(session) is None:
+        return paused
+    session.pending_user_choice = PendingUserChoice(
+        title=STALL_MENU_TITLE,
+        options=(STALL_OPTION_MORE, STALL_OPTION_STOP),
+        commands=dict(STALL_COMMANDS),
+    )
+    set_auto_command(session, "/choose")
+    return paused
+
+
 def _clear_host_autosubmit(session: Any) -> None:
     """Drop any queued shell autosubmit when the session goal stops continuing."""
     clear_pending_autosubmit(session)
@@ -179,6 +224,10 @@ def _finish_outer_turn(
         active = active.with_status(SessionGoalStatus.BUDGET_EXHAUSTED)
         active = _paint(session, active, on_progress)
         _clear_host_autosubmit(session)
+        return active, last, True
+
+    if goal_has_stalled(active):
+        active = pause_for_no_progress(session, active, on_progress)
         return active, last, True
 
     # Still active under budget: skip paint here — ``_announce_working`` owns
