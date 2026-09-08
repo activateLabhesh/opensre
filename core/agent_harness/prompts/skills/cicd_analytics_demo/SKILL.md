@@ -9,6 +9,12 @@ description: >-
   performance", "how reliable is our CI", "what does flaky CI cost us". Not for
   listing currently failing checks (github-ci-health). Multi-step; load before
   acting.
+tools:
+  - scan_local_git_workspace
+  - analyze_github_ci_reliability
+  - schedule_ci_reliability_loop
+  - cli_exec
+  - ask_user_choice
 ---
 ══════════════════════════════════════════════════════════
 CI/CD ANALYTICS DEMO SKILL — interactive-shell action agent:
@@ -26,6 +32,7 @@ USE THESE TOOLS:
 - `scan_local_git_workspace`
 - `analyze_github_ci_reliability`
 - `schedule_ci_reliability_loop`
+- `cli_exec`
 - `ask_user_choice`
 
 DO NOT USE THIS SKILL FOR:
@@ -37,9 +44,10 @@ DO NOT USE THIS SKILL FOR:
 HARD RULES:
 - Every number in the reply comes from a tool result. Never estimate, round
   up, or invent executions, failures, rates, or minutes.
-- Never run `gh`, `git`, or `shell_run` for this flow; the two tools own
-  discovery and analysis end to end and are read-only. The whole demo is
-  read-only: no Slack messages, no pushes, no issue writes.
+- Never run `gh`, `git`, or `shell_run` for this flow; the scan and
+  analysis tools own discovery and analysis end to end and are read-only.
+  The analysis itself is read-only: no Slack messages, no pushes, no
+  issue writes. Use `cli_exec` only for the Slack continuation in step 4.
 - The scan tool draws the workspace chart in the shell itself. Do not repeat
   the chart or the repository list as text; add one sentence at most.
 - `analyze_github_ci_reliability` renders the finished report in the shell.
@@ -50,6 +58,10 @@ HARD RULES:
   not fall back to a different data source.
 - Decision points use `ask_user_choice` with the exact option texts below.
   End the turn after calling it; the answer arrives as the next user message.
+- Ask each question once. When the answer arrives, continue with the next
+  step immediately: do not reload this skill, do not restate the options, and
+  never ask what the answer or the request "means". A repository name in the
+  request or in the answer is the repository; go straight to step 3.
 
 Steps, in order (headers are mandatory, see the labeling rules below).
 When the request already names the repository (the startup demo does the scan
@@ -89,10 +101,10 @@ headers [3/4] and [4/4] only.
    analyzed repository, output its `response_text` verbatim, and stop; it
    schedules a weekday 08:00 local check that delivers to this shell's inbox
    and never posts anywhere else. Each tick is deterministic (no model turn);
-   `/loops service install` keeps it running when no shell is open. On the second, check Slack with the CLI tool
-   (`/integrations verify slack`); if it is not configured, run
-   `opensre integrations setup slack` through the CLI tool, otherwise say it is
-   connected. Then explain in two sentences how to hand off a chore from Slack
+   `/loops service install` keeps it running when no shell is open. On the second, call
+   `cli_exec` with payload `integrations verify slack`; if Slack is not
+   configured, call `cli_exec` with payload `integrations setup slack`,
+   otherwise say it is connected. Then explain in two sentences how to hand off a chore from Slack
    (mention OpenSRE in a channel or DM it). Never post, reply, or send anything
    to Slack in this demo. On `Exit demo`, reply with one line and stop.
 
