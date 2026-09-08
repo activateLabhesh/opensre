@@ -19,7 +19,9 @@ To create a new skill:
    skill must run first. The loader ignores it; people and the docs read it.
 6. Optional report template: a sibling file named <folder>_report.md is
    appended automatically to the body that skill_view returns.
-7. Section order below is the house style (see github_ci_fix for a
+7. Optional `getting_started:` (verbatim first-visit demo label) plus
+   `demo_order:` (1-based menu row, A=1) attach this skill to `/demo`.
+8. Section order below is the house style (see github_ci_fix for a
    single-tool skill, architecture_audit for a multi-pass one). Keep the
    whole body tight — it is loaded into the planner's context on demand.
 -->
