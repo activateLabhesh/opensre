@@ -27,12 +27,10 @@ from core.agent_harness.session_goal.goal import (
     SessionGoal,
     SessionGoalReason,
     SessionGoalStatus,
-    apply_session_goal_progress,
     attach_session_goal,
     refresh_session_goal_reason,
     session_goal_is_active,
     session_goal_is_paused,
-    strip_session_goal_progress_tags,
 )
 from core.agent_harness.turns.turn_results import ToolCallingTurnResult, TurnResult
 
@@ -56,34 +54,22 @@ def _empty_turn_result() -> TurnResult:
     )
 
 
-def _refresh_active(session: Any, active: SessionGoal, result: TurnResult) -> SessionGoal:
-    """Merge checklist progress from the reply and keep session in sync."""
-    updated = apply_session_goal_progress(active, session_goal_reply_text(result))
+def _record_goal_turn(session: Any, active: SessionGoal) -> SessionGoal:
+    """Count this chat as a session-goal turn and keep tool ticks on the session.
+
+    ``session_goal_complete`` attaches ticks onto ``session.session_goal``.
+    Recording the loop copy first would wipe them; merge them back so evaluate
+    sees ``new_ticks`` and custom evaluate callbacks still advance ``turns_used``.
+    """
+    stored = getattr(session, "session_goal", None)
+    completed = active.completed
+    if isinstance(stored, SessionGoal):
+        completed = completed | stored.completed
+    updated = active.record_turn()
+    if completed != updated.completed:
+        updated = updated.with_completed(completed)
     attach_session_goal(session, updated)
     return updated
-
-
-def _scrub_progress_tags(result: TurnResult) -> TurnResult:
-    """Hide ``session_goal:done=`` / ``achieved`` tokens from the user-visible reply.
-
-    Scrubs both ``assistant_response_text`` and any action ``response_text`` so
-    shell and gateway ``primary_response_text`` stay tag-free.
-    """
-    assistant = result.assistant_response_text or ""
-    cleaned_assistant = strip_session_goal_progress_tags(assistant)
-    action = result.action_result
-    action_text = getattr(action, "response_text", "") or ""
-    cleaned_action = strip_session_goal_progress_tags(action_text)
-    if cleaned_assistant == assistant and cleaned_action == action_text:
-        return result
-    new_action = action
-    if cleaned_action != action_text and hasattr(action, "response_text"):
-        new_action = replace(action, response_text=cleaned_action)
-    return replace(
-        result,
-        assistant_response_text=cleaned_assistant,
-        action_result=new_action,
-    )
 
 
 def _paint(
@@ -124,15 +110,15 @@ def _announce_working(
 
 
 _NO_PROGRESS_TURNS = 2
-STALL_MENU_TITLE = "The goal made no checklist progress in 2 turns. How should I continue?"
+STALL_MENU_TITLE = "The goal made no progress in 2 turns. How should I continue?"
 STALL_OPTION_MORE = "Keep going for one more turn"
 STALL_OPTION_STOP = "Stop here; the work above is enough"
 STALL_COMMANDS = {STALL_OPTION_MORE: "/goal resume", STALL_OPTION_STOP: "/goal clear"}
 
 
 def goal_has_stalled(goal: SessionGoal) -> bool:
-    """True when a checklist goal has gone two turns without a new tick."""
-    if not goal.checklist or goal.checklist_complete:
+    """True when two turns passed with no checklist tick and no successful tool."""
+    if goal.checklist_complete:
         return False
     return goal.turns_used - goal.last_progress_turns_used >= _NO_PROGRESS_TURNS
 
@@ -142,10 +128,10 @@ def pause_for_no_progress(
 ) -> SessionGoal:
     """Pause a stalled goal; the shell also opens a menu with the ways forward.
 
-    Two full turns without a new tick means repeating the same steps to the
-    budget. The interactive shell asks: one more turn, stop, or typed guidance
-    (the custom row). Headless hosts have no ``/choose`` handler, so they only
-    pause and return.
+    Two full turns without a tick or a successful tool means repeating the
+    same steps to the budget. The interactive shell asks: one more turn, stop,
+    or typed guidance (the custom row). Headless hosts have no ``/choose``
+    handler, so they only pause and return.
     """
     paused = active.with_status(SessionGoalStatus.PAUSED).with_reason(
         SessionGoalReason.PAUSED_NO_PROGRESS
@@ -176,19 +162,17 @@ def _finish_outer_turn(
     evaluate_fn: EvaluateFn,
     on_progress: ProgressFn | None,
 ) -> tuple[SessionGoal, TurnResult, bool]:
-    """Refresh → evaluate → single paint. Returns ``(goal, scrubbed, stop)``."""
-    active = _refresh_active(session, active, last)
-
+    """Evaluate → single paint. Returns ``(goal, result, stop)``."""
     if last.cancelled:
         active = active.with_status(SessionGoalStatus.CANCELLED)
         active = _paint(session, active, on_progress)
         _clear_host_autosubmit(session)
-        return active, _scrub_progress_tags(last), True
+        return active, last, True
 
     if getattr(session, "pending_user_choice", None) is not None:
         active = active.with_reason(SessionGoalReason.PAUSED_USER_CHOICE)
         active = _paint(session, active, on_progress, rederive=False)
-        return active, _scrub_progress_tags(last), True
+        return active, last, True
 
     next_status = evaluate_fn(active, last, session=session)
     stored = getattr(session, "session_goal", None)
@@ -213,7 +197,7 @@ def _finish_outer_turn(
     if active.status != next_status:
         active = active.with_status(next_status)
         attach_session_goal(session, active)
-    last = _scrub_progress_tags(last)
+    last = last
 
     if next_status != SessionGoalStatus.ACTIVE:
         active = _paint(session, active, on_progress, rederive=False)
@@ -230,9 +214,10 @@ def _finish_outer_turn(
         active = pause_for_no_progress(session, active, on_progress)
         return active, last, True
 
-    # Still active under budget: skip paint here — ``_announce_working`` owns
-    # the next status line so the TTY does not show two near-identical
-    # ``◎ /goal active`` blocks back-to-back before the continuation turn.
+    # Still active under budget: paint the verdict (the judge's reason) before
+    # ``_announce_working`` paints the next turn's line. Hosts render both as
+    # one-line status rows, so the reason is visible between turns.
+    active = _paint(session, active, on_progress, rederive=False)
     return active, last, False
 
 
@@ -279,6 +264,7 @@ def run_until_session_goal(
         had_active_before = True
         _announce_working(session, pre, on_progress)
 
+    pre_chat_completed = pre.completed if isinstance(pre, SessionGoal) else frozenset()
     last = chat(message)
     active = getattr(session, "session_goal", None)
     if not isinstance(active, SessionGoal) or not session_goal_is_active(session):
@@ -293,15 +279,24 @@ def run_until_session_goal(
         )
         return SessionGoalRunResult(goal=synthetic, last_result=last, turn_count=1)
 
-    # ``/goal set`` attaches a host-owned goal mid-turn and queues autosubmit.
-    # That attach turn must not count against the budget or run evaluate —
-    # the next submitted condition is the first real session-goal turn.
+    # ``/goal set`` attaches a host-owned goal mid-turn. The attach turn must
+    # not count against the budget or run evaluate. The shell queues the
+    # condition as the next REPL submit. Headless hosts have no REPL, so the
+    # condition starts here as the first real session-goal turn.
     if not had_active_before and active.host_owned and active.turns_used == 0:
-        return SessionGoalRunResult(goal=active, last_result=last, turn_count=0)
+        if session_terminal(session) is not None:
+            return SessionGoalRunResult(goal=active, last_result=last, turn_count=0)
+        last = chat(active.condition)
+        stored = getattr(session, "session_goal", None)
+        if isinstance(stored, SessionGoal):
+            active = stored
 
-    if active.turns_used == 0:
-        active = active.record_turn()
-        attach_session_goal(session, active)
+    if had_active_before or active.turns_used == 0:
+        # This chat was a goal turn: the first one, or a resumed goal's next
+        # one. Evaluate must see this-turn tool ticks as new, so re-read them
+        # from the session instead of the pre-chat copy.
+        active = replace(active, completed=pre_chat_completed, new_ticks=frozenset())
+        active = _record_goal_turn(session, active)
 
     active, last, stop = _finish_outer_turn(
         session,
@@ -328,8 +323,7 @@ def run_until_session_goal(
 
         _announce_working(session, active, on_progress)
         last = chat(continuation_prompt(active))
-        active = active.record_turn()
-        attach_session_goal(session, active)
+        active = _record_goal_turn(session, active)
         active, last, stop = _finish_outer_turn(
             session,
             active,
